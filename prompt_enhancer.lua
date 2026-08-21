@@ -22,14 +22,14 @@ M.model      = "claude-haiku-4-5-20251001"  -- fast; swap to a Sonnet id for hig
 M.maxTokens  = 2000
 M.autoPaste  = true   -- false = leave result on the clipboard instead of pasting
 
--- Repo context: a handful of lines about what you are working on right now,
--- appended to each request. Cheap enough (<100 tokens) not to cost latency.
 -- Spinner: tune without touching the animation loop.
 M.spinnerInterval = 0.08   -- seconds per frame
 M.spinnerWidth    = 14     -- cells in the track
 M.spinnerGlyph    = "🚀"
 M.spinnerTrail    = false  -- true = leave a trail of dots behind the rocket
 
+-- Repo context: a handful of lines about what you are working on right now,
+-- appended to each request. Cheap enough (<100 tokens) not to cost latency.
 M.contextEnabled = true
 M.projectRoots   = {   -- where to look for the folder named in the window title
   HOME .. "/Desktop", HOME .. "/Documents", HOME .. "/Projects", HOME .. "/src", HOME,
