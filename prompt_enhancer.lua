@@ -626,7 +626,7 @@ end
 -- Eyeball the animation without spending a token:
 --   hs -c 'require("prompt_enhancer").previewHud()'      -- or ("fail")
 function M.previewHud(outcome)
-  local hud = HUD.start("Enhancing prompt")
+  local hud = HUD.start("Prancing")
   hud:note("input", describe(string.rep("word ", 218)))
 
   -- Parked on the HUD: an unreferenced one-shot timer can be collected before
@@ -662,7 +662,7 @@ function M.run(profileName)
     return
   end
   inFlight = true
-  local hud = HUD.start("Enhancing prompt")
+  local hud = HUD.start("Prancing")
 
   captureSelection(function(selection, savedClipboard)
     if not selection or trim(selection) == "" then

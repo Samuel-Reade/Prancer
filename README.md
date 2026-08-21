@@ -161,7 +161,7 @@ Disable with `M.contextEnabled = false`.
 A run has four stages, and the panel names the one it is in rather than spinning anonymously:
 
 ```
-Enhancing prompt                          claude-haiku-4-5
+Prancing                                  claude-haiku-4-5
 Rewriting your prompt                                 2.1s
 218 words  ·  ~273 tok  ·  Prancer (branch main)
 ━━━━━━━━━━━━━━━━━━🚀 · · · · · · · · · · · · · · · · · ·
