@@ -22,11 +22,10 @@ M.model      = "claude-haiku-4-5-20251001"  -- fast; swap to a Sonnet id for hig
 M.maxTokens  = 2000
 M.autoPaste  = true   -- false = leave result on the clipboard instead of pasting
 
--- Spinner: tune without touching the animation loop.
-M.spinnerInterval = 0.08   -- seconds per frame
-M.spinnerWidth    = 14     -- cells in the track
-M.spinnerGlyph    = "🚀"
-M.spinnerTrail    = false  -- true = leave a trail of dots behind the rocket
+-- Loading HUD: tune without touching the animation loop.
+M.hudGlyph = "🚀"   -- rides the leading edge of the progress bar
+M.hudFps   = 60     -- animation frames per second
+M.hudDrop  = 0.70   -- vertical placement: 0 = top of screen, 1 = bottom
 
 -- Repo context: a handful of lines about what you are working on right now,
 -- appended to each request. Cheap enough (<100 tokens) not to cost latency.
@@ -226,7 +225,7 @@ end
 -- API
 --------------------------------------------------------------------------------
 
-local function enhanceText(profileName, text, onSuccess, onError)
+local function enhanceText(profileName, text, hud, onSuccess, onError)
   local key = apiKey()
   if not key then
     return onError("No API key at " .. KEY_FILE)
@@ -237,8 +236,13 @@ local function enhanceText(profileName, text, onSuccess, onError)
     return onError("No profile: " .. profileName .. ".md")
   end
 
+  hud:enter("context")
   local context = M.repoContext()
   M.lastContext = context
+  -- The repo line if there is one, else whatever file the editor is showing.
+  local where = context and (context:match("Repo: ([^\n]+)")
+                          or context:match("Currently editing: ([^\n]+)"))
+  hud:note("context", where and where:gsub("%s+", " ") or "no repo context")
   local content = context
     and (text .. "\n\n<context>\n" .. context .. "\n</context>")
     or text
@@ -256,6 +260,7 @@ local function enhanceText(profileName, text, onSuccess, onError)
     ["anthropic-version"] = "2023-06-01",
   }
 
+  hud:enter("model")
   hs.http.asyncPost(API_URL, body, headers, function(status, response)
     if status ~= 200 then
       local detail = ""
@@ -283,46 +288,367 @@ local function enhanceText(profileName, text, onSuccess, onError)
 end
 
 --------------------------------------------------------------------------------
--- Spinner
+-- Loading HUD
 --------------------------------------------------------------------------------
 
--- Monospace, so the box does not resize between frames.
-local SPINNER_STYLE = { textFont = "Menlo", textSize = 16 }
+-- A run has four stages, and the HUD names the one it is in rather than
+-- spinning anonymously. Each stage owns a slice of the bar and eases toward its
+-- ceiling without ever arriving, so a slow stage keeps creeping instead of
+-- freezing. The percentage is an estimate for that reason -- one non-streaming
+-- POST has no real progress to report. The stage, the stage count, the counts
+-- on the detail line and the elapsed clock are all exact.
+local STAGES = {
+  { key = "capture", label = "Reading your selection", ceiling = 0.10, tau = 0.30 },
+  { key = "context", label = "Checking the repo",      ceiling = 0.26, tau = 0.35 },
+  { key = "model",   label = "Rewriting your prompt",  ceiling = 0.93, tau = 2.20 },
+  { key = "deliver", label = "Pasting it back",        ceiling = 1.00, tau = 0.25 },
+}
 
--- Returns a stop function. The rocket advances one cell per frame, leaving a
--- trail of dots behind it, and wraps back to the start.
-local function startSpinner(label)
-  local index   = 0
-  local showing = nil
+local STAGE_AT = {}
+for i, s in ipairs(STAGES) do STAGE_AT[s.key] = i end
 
-  local function draw()
-    local cells = {}
-    for cell = 0, M.spinnerWidth - 1 do
-      if     cell == index      then cells[#cells + 1] = M.spinnerGlyph
-      elseif cell < index and M.spinnerTrail then cells[#cells + 1] = "."
-      else                           cells[#cells + 1] = " " end
-    end
+-- Layout. Every element is positioned off these, so nudging one number moves a
+-- whole row instead of breaking the panel.
+local HUD_W, HUD_H = 460, 132
+local PAD          = 20
+local BAR          = { x = PAD, y = 84, w = HUD_W - PAD * 2, h = 10 }
+local DOT          = { y = 109, gap = 15, r = 3.5 }
+local SHIMMER_W    = 84
+local DONE_HOLD, FAIL_HOLD, SHAKE = 0.85, 3.2, 0.4
 
-    -- Close before showing. Two alerts alive at once stack vertically instead
-    -- of replacing each other.
-    if showing then hs.alert.closeSpecific(showing) end
-    showing = hs.alert.show(label .. "  " .. table.concat(cells),
-                            SPINNER_STYLE, hs.screen.mainScreen(), 10)
-  end
+-- Element indices, in the order they are appended in build() below.
+local E = {
+  card = 1, title = 2, badge = 3, status = 4, elapsed = 5, detail = 6,
+  track = 7, fill = 8, clip = 9, shimmer = 10, unclip = 11,
+  rocket = 12, percent = 13,
+  dots = 14,  -- one per stage: 14 .. 14 + #STAGES - 1
+}
 
-  draw()
-  local timer = hs.timer.doEvery(M.spinnerInterval, function()
-    index = (index + 1) % M.spinnerWidth
-    draw()
+local function rgb(r, g, b)  return { red = r/255, green = g/255, blue = b/255, alpha = 1 } end
+local function ink(a)        return { white = 1, alpha = a } end
+local function fade(c, a)    return { red = c.red, green = c.green, blue = c.blue, alpha = a } end
+
+local PALETTE = {
+  running = { rgb(255, 122,  69), rgb(255, 186, 107) },
+  done    = { rgb( 52, 211, 153), rgb(134, 239, 172) },
+  failed  = { rgb(248, 113, 113), rgb(252, 165, 165) },
+}
+
+-- Fixed order, so a note added by a later stage lands after the earlier ones.
+local NOTE_ORDER = { "input", "context", "result" }
+
+local function nowSec() return hs.timer.secondsSinceEpoch() end
+
+-- claude-haiku-4-5-20251001 -> claude-haiku-4-5
+local function shortModel(id) return (id:gsub("%-%d%d%d%d%d%d%d%d$", "")) end
+
+-- "218 words · ~290 tok"
+local function describe(text)
+  local words = select(2, text:gsub("%S+", ""))
+  return string.format("%d word%s  ·  ~%d tok", words, words == 1 and "" or "s", math.ceil(#text / 4))
+end
+
+--------------------------------------------------------------------------------
+
+-- Canvas creation can fail (no screen, no window server). A run must still
+-- finish and still paste when it does, so fall back to a stub that keeps the
+-- one message the user cannot afford to miss.
+local NULL_HUD = {
+  enter = function() end, note = function() end, done = function() end,
+  nudge = function() end, close = function() end,
+  fail  = function(_, message) hs.alert.show("Enhance failed — " .. message, 4) end,
+}
+NULL_HUD.__index = NULL_HUD
+
+local HUD = {}
+HUD.__index = HUD
+
+-- The panel outlives its run by a hold-and-fade, so a quick second press would
+-- otherwise draw a new one on top of the old.
+local activeHud = nil
+
+function HUD.start(title)
+  if activeHud then activeHud:close() end
+  local screen = hs.screen.mainScreen() or hs.screen.primaryScreen()
+  local frame  = screen and screen:frame()
+  local canvas = frame and hs.canvas.new({
+    x = frame.x + (frame.w - HUD_W) / 2,
+    y = frame.y + (frame.h - HUD_H) * M.hudDrop,
+    w = HUD_W, h = HUD_H,
+  })
+  if not canvas then return setmetatable({}, NULL_HUD) end
+
+  local self = setmetatable({
+    canvas   = canvas,
+    origin   = canvas:frame(),
+    state    = "running",
+    stage    = 1,
+    floor    = 0,       -- progress at the moment the current stage began
+    shown    = 0,       -- eased toward the target, so the bar never jumps
+    sweep    = 0,
+    parts    = {},
+    startAt  = nowSec(),
+    stageAt  = nowSec(),
+    lastTick = nowSec(),
+  }, HUD)
+
+  canvas:level(hs.canvas.windowLevels.screenSaver)
+  canvas:behavior(hs.canvas.windowBehaviors.canJoinAllSpaces
+                + hs.canvas.windowBehaviors.stationary)
+  canvas:clickActivating(false)   -- a stray click must not pull focus off the app we paste into
+  self:build(title)
+  canvas:show(0.12)
+  activeHud = self
+
+  self.timer = hs.timer.doEvery(1 / M.hudFps, function()
+    -- A broken frame should take the panel down, not leave it stuck on screen.
+    if not pcall(function() self:tick() end) then self:close() end
   end)
+  return self
+end
 
-  return function()
-    timer:stop()
-    if showing then hs.alert.closeSpecific(showing) end
+function HUD:build(title)
+  local accent = PALETTE.running
+
+  self.canvas:appendElements(
+    { type = "rectangle", action = "strokeAndFill",
+      frame = { x = 0, y = 0, w = HUD_W, h = HUD_H },
+      roundedRectRadii = { xRadius = 18, yRadius = 18 },
+      fillColor = { red = 0.07, green = 0.07, blue = 0.086, alpha = 0.94 },
+      strokeColor = ink(0.12), strokeWidth = 1,
+      withShadow = true,
+      shadow = { blurRadius = 26, color = { alpha = 0.5 }, offset = { h = -8, w = 0 } } },
+
+    { type = "text", text = title,
+      frame = { x = PAD, y = 15, w = HUD_W - PAD * 2 - 160, h = 22 },
+      textFont = "HelveticaNeue-Medium", textSize = 15, textColor = ink(0.96) },
+
+    { type = "text", text = shortModel(M.model),
+      frame = { x = HUD_W - PAD - 220, y = 19, w = 220, h = 18 },
+      textFont = "Menlo-Regular", textSize = 10.5, textColor = ink(0.36),
+      textAlignment = "right", textLineBreak = "truncateHead" },
+
+    { type = "text", text = STAGES[1].label,
+      frame = { x = PAD, y = 41, w = HUD_W - PAD * 2 - 70, h = 20 },
+      textFont = "HelveticaNeue", textSize = 13, textColor = ink(0.80),
+      textLineBreak = "truncateTail" },
+
+    { type = "text", text = "0.0s",
+      frame = { x = HUD_W - PAD - 80, y = 42, w = 80, h = 18 },
+      textFont = "Menlo-Regular", textSize = 11.5, textColor = ink(0.42),
+      textAlignment = "right" },
+
+    { type = "text", text = "",
+      frame = { x = PAD, y = 60, w = HUD_W - PAD * 2, h = 18 },
+      textFont = "HelveticaNeue", textSize = 11, textColor = ink(0.34),
+      textLineBreak = "truncateTail" },
+
+    { type = "rectangle", action = "fill",
+      frame = { x = BAR.x, y = BAR.y, w = BAR.w, h = BAR.h },
+      roundedRectRadii = { xRadius = BAR.h / 2, yRadius = BAR.h / 2 },
+      fillColor = ink(0.09) },
+
+    { type = "rectangle", action = "fill",
+      frame = { x = BAR.x, y = BAR.y, w = 0.01, h = BAR.h },
+      roundedRectRadii = { xRadius = BAR.h / 2, yRadius = BAR.h / 2 },
+      fillGradient = "linear", fillGradientAngle = 0,
+      fillGradientColors = { accent[1], accent[2] } },
+
+    -- Clip the sweep to the filled part, so it never lights up empty track.
+    { type = "rectangle", action = "clip",
+      frame = { x = BAR.x, y = BAR.y, w = 0.01, h = BAR.h },
+      roundedRectRadii = { xRadius = BAR.h / 2, yRadius = BAR.h / 2 } },
+
+    { type = "rectangle", action = "fill",
+      frame = { x = BAR.x, y = BAR.y, w = SHIMMER_W, h = BAR.h },
+      fillGradient = "linear", fillGradientAngle = 0,
+      fillGradientColors = { ink(0), ink(0.34), ink(0) } },
+
+    { type = "resetClip" },
+
+    { type = "text", text = M.hudGlyph,
+      frame = { x = BAR.x - 12, y = BAR.y - 7, w = 24, h = 24 },
+      textSize = 17, textAlignment = "center",
+      withShadow = true,
+      shadow = { blurRadius = 5, color = { alpha = 0.7 }, offset = { h = -2, w = 0 } } },
+
+    { type = "text", text = "0%",
+      frame = { x = HUD_W - PAD - 70, y = 101, w = 70, h = 18 },
+      textFont = "Menlo-Bold", textSize = 11.5, textColor = ink(0.55),
+      textAlignment = "right" }
+  )
+
+  for i = 1, #STAGES do
+    self.canvas:appendElements({ type = "circle", action = "fill",
+      center = { x = PAD + DOT.r + (i - 1) * DOT.gap, y = DOT.y },
+      radius = DOT.r, fillColor = ink(0.14) })
   end
 end
 
-M.startSpinner = startSpinner  -- exposed so you can eyeball it without a real run
+--------------------------------------------------------------------------------
+-- Reporting in
+
+-- Where the bar would be right now if nothing else changed.
+function HUD:target()
+  local stage = STAGES[self.stage]
+  local held  = nowSec() - self.stageAt
+  return self.floor + (stage.ceiling - self.floor) * (1 - math.exp(-held / stage.tau))
+end
+
+function HUD:enter(key)
+  local i = STAGE_AT[key]
+  if not i or self.state ~= "running" or i <= self.stage then return end
+  self.floor   = self:target()   -- carry the bar forward rather than restarting it
+  self.stage   = i
+  self.stageAt = nowSec()
+  self.canvas[E.status].text = STAGES[i].label
+end
+
+function HUD:note(key, value)
+  self.parts[key] = value
+  local out = {}
+  for _, k in ipairs(NOTE_ORDER) do
+    if self.parts[k] then out[#out + 1] = self.parts[k] end
+  end
+  self.canvas[E.detail].text = table.concat(out, "  ·  ")
+end
+
+function HUD:paint(name)
+  local accent = PALETTE[name]
+  self.canvas[E.shimmer].frame = { x = BAR.x, y = BAR.y, w = 0.01, h = BAR.h }
+  self.canvas[E.fill].fillGradientColors = { accent[1], accent[2] }
+  self.canvas[E.percent].textColor       = fade(accent[2], 0.9)
+end
+
+function HUD:done(summary)
+  if self.state ~= "running" then return end
+  self.state = "done"
+  self.canvas[E.status].text = M.autoPaste and "Pasted into place" or "Copied to your clipboard"
+  self.canvas[E.status].textColor = ink(0.95)
+  self.parts = {}
+  self:note("result", summary or "")
+  self:paint("done")
+  self.closeAt = nowSec() + DONE_HOLD
+end
+
+function HUD:fail(message)
+  if self.state ~= "running" then return end
+  self.state = "failed"
+  self.canvas[E.status].text      = message
+  self.canvas[E.status].textColor = fade(PALETTE.failed[2], 0.95)
+  self.canvas[E.rocket].text      = "⚠️"
+  self.parts = {}
+  self:note("result", "Nothing pasted — your clipboard is untouched")
+  self:paint("failed")
+  self.shakeUntil = nowSec() + SHAKE
+  self.closeAt    = nowSec() + FAIL_HOLD
+end
+
+-- A second keypress while a run is in flight: say "still working" rather than
+-- swallowing it silently.
+function HUD:nudge()
+  if self.state == "running" then self.shakeUntil = nowSec() + SHAKE end
+end
+
+function HUD:close()
+  if self.closed then return end
+  self.closed = true
+  if activeHud == self then activeHud = nil end
+  if self.timer then self.timer:stop() end
+  self.canvas:delete(0.25)
+end
+
+--------------------------------------------------------------------------------
+-- One frame
+
+function HUD:tick()
+  local t  = nowSec()
+  local dt = t - self.lastTick
+  self.lastTick = t
+  local c   = self.canvas
+  local age = t - self.startAt
+
+  if (self.closeAt and t >= self.closeAt) or age > 90 then return self:close() end
+
+  -- Progress: aim at the stage curve, then chase that with a fixed-rate ease so
+  -- a stage change slides in instead of snapping.
+  local target = self.state == "running" and self:target()
+              or (self.state == "done" and 1 or self.shown)
+  self.shown = self.shown + (target - self.shown) * (1 - math.exp(-dt * 10))
+  -- Land exactly on the end rather than easing toward it forever: 99% under a
+  -- filled bar reads as a rounding bug.
+  if self.state ~= "running" and math.abs(target - self.shown) < 0.006 then self.shown = target end
+
+  local width = math.max(0.01, self.shown * BAR.w)
+  local edge  = BAR.x + width
+  c[E.fill].frame = { x = BAR.x, y = BAR.y, w = width, h = BAR.h }
+  c[E.clip].frame = { x = BAR.x, y = BAR.y, w = width, h = BAR.h }
+
+  -- Sweep runs only while there is something left to wait for.
+  if self.state == "running" then
+    self.sweep = (self.sweep + dt * 300) % (BAR.w + SHIMMER_W)
+    c[E.shimmer].frame = { x = BAR.x - SHIMMER_W + self.sweep, y = BAR.y, w = SHIMMER_W, h = BAR.h }
+  end
+
+  local bob = self.state == "running" and math.sin(t * 7) * 1.6 or 0
+  c[E.rocket].frame = { x = edge - 12, y = BAR.y - 7 + bob, w = 24, h = 24 }
+
+  c[E.elapsed].text     = string.format("%.1fs", age)
+  c[E.percent].text     = string.format("%d%%", math.floor(self.shown * 100 + 0.5))
+  c[E.card].strokeColor = ink(0.10 + 0.06 * (0.5 + 0.5 * math.sin(t * 3)))
+
+  local accent = PALETTE[self.state]
+  for i = 1, #STAGES do
+    local dot = E.dots + i - 1
+    if self.state == "done" or i < self.stage then
+      c[dot].fillColor, c[dot].radius = fade(accent[1], 0.55), DOT.r
+    elseif i == self.stage then
+      c[dot].fillColor = fade(accent[2], 1)
+      c[dot].radius    = DOT.r + 1 + (self.state == "running" and math.sin(t * 5) * 0.8 or 0)
+    else
+      c[dot].fillColor, c[dot].radius = ink(0.14), DOT.r
+    end
+  end
+
+  -- Entrance lift, and a decaying shake for "failed" or "already working".
+  local dy = age < 0.5 and 14 * math.exp(-age * 14) or 0
+  local dx = 0
+  if self.shakeUntil then
+    local left = self.shakeUntil - t
+    if left > 0 then dx = math.sin(t * 48) * 10 * (left / SHAKE) else self.shakeUntil = nil end
+  end
+  if dx ~= 0 or dy ~= 0 or self.offset then
+    c:topLeft({ x = self.origin.x + dx, y = self.origin.y + dy })
+    self.offset = dx ~= 0 or dy ~= 0
+  end
+end
+
+-- Eyeball the animation without spending a token:
+--   hs -c 'require("prompt_enhancer").previewHud()'      -- or ("fail")
+function M.previewHud(outcome)
+  local hud = HUD.start("Enhancing prompt")
+  hud:note("input", describe(string.rep("word ", 218)))
+
+  -- Parked on the HUD: an unreferenced one-shot timer can be collected before
+  -- it fires, which silently skips the stage it was meant to trigger.
+  hud.preview = {}
+  local function at(delay, fn) hud.preview[#hud.preview + 1] = hs.timer.doAfter(delay, fn) end
+
+  at(0.5, function() hud:enter("context") end)
+  at(1.0, function()
+    hud:enter("model")
+    hud:note("context", "Prancer (branch main)")
+  end)
+  at(3.4, function()
+    if outcome == "fail" then
+      hud:fail("API 401: invalid x-api-key")
+    else
+      hud:enter("deliver")
+      at(0.3, function() hud:done("218 → 312 words") end)
+    end
+  end)
+  return hud
+end
 
 --------------------------------------------------------------------------------
 -- Public entry point
@@ -331,29 +657,34 @@ M.startSpinner = startSpinner  -- exposed so you can eyeball it without a real r
 local inFlight = false
 
 function M.run(profileName)
-  if inFlight then return end
+  if inFlight then
+    if activeHud then activeHud:nudge() end   -- already working; don't drop the press silently
+    return
+  end
   inFlight = true
+  local hud = HUD.start("Enhancing prompt")
 
   captureSelection(function(selection, savedClipboard)
     if not selection or trim(selection) == "" then
       inFlight = false
       if savedClipboard then hs.pasteboard.setContents(savedClipboard) end
-      return hs.alert.show("Nothing selected")
+      return hud:fail("Nothing selected")
     end
 
-    local stopSpinner = startSpinner("Enhancing")
+    hud:note("input", describe(selection))
 
-    enhanceText(profileName, selection,
+    enhanceText(profileName, selection, hud,
       function(result)
-        stopSpinner()
+        hud:enter("deliver")
         logHistory(profileName, selection, result)
         deliver(result, savedClipboard)
+        hud:done(string.format("%d → %d words",
+          select(2, selection:gsub("%S+", "")), select(2, result:gsub("%S+", ""))))
         inFlight = false
       end,
       function(err)
-        stopSpinner()
         if savedClipboard then hs.pasteboard.setContents(savedClipboard) end
-        hs.alert.show("Enhance failed — " .. err, 4)
+        hud:fail(err)
         inFlight = false
       end)
   end)

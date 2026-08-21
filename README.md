@@ -107,7 +107,7 @@ Or System Settings → Keyboard → "Press 🌐 to:" → **Do Nothing**. May nee
 | **⌥⌘C** | Same thing — fallback binding |
 | **⌥⌘⇧R** | Reload profiles after editing the prompt |
 
-Select text, press the key, watch the rocket, and about a second later your selection is replaced.
+Select text, press the key, watch the panel count off the stages, and about a second later your selection is replaced.
 
 Only a *tap* of 🌐 triggers it. Holding it, or using it with another key (🌐+F5, 🌐+arrow), behaves normally — enforced by a 0.6s maximum hold and a check that nothing else was pressed.
 
@@ -156,6 +156,36 @@ The profile documents the block as a hint rather than a scope, so real paths get
 
 Disable with `M.contextEnabled = false`.
 
+### The loading panel
+
+A run has four stages, and the panel names the one it is in rather than spinning anonymously:
+
+```
+Enhancing prompt                          claude-haiku-4-5
+Rewriting your prompt                                 2.1s
+218 words  ·  ~273 tok  ·  Prancer (branch main)
+━━━━━━━━━━━━━━━━━━🚀 · · · · · · · · · · · · · · · · · ·
+● ● ● ○                                                47%
+```
+
+The stage, the dots, the counts and the clock are all exact. **The percentage is an
+estimate** — a single non-streaming POST has no real progress to report. Each stage
+owns a slice of the bar and eases toward its ceiling without ever arriving, so a slow
+model keeps the bar creeping instead of freezing at a number. It reaches 100% only
+once the text is actually pasted.
+
+It resolves in place rather than just vanishing: green with `218 → 312 words` on
+success, red on failure carrying the API's own message plus a reminder that nothing
+was pasted and your clipboard is untouched. Pressing the key again mid-run nudges the
+panel instead of being dropped in silence.
+
+Eyeball the animation without spending a token:
+
+```bash
+hs -c 'require("prompt_enhancer").previewHud()'        # success
+hs -c 'require("prompt_enhancer").previewHud("fail")'  # failure
+```
+
 ### Adding profiles
 
 Each target is a markdown file plus one binding. Drop `long_form.md` into `~/.config/prompt-enhancer/profiles/` and bind it in `init.lua` — the code is target-agnostic.
@@ -171,10 +201,9 @@ All fields on `M`, at the top of [`prompt_enhancer.lua`](prompt_enhancer.lua):
 | `autoPaste` | `true` | `false` leaves the result on the clipboard instead |
 | `contextEnabled` | `true` | Repo context block |
 | `projectRoots` | Desktop, Documents, Projects, src, ~ | Where to look for the folder named in the window title |
-| `spinnerInterval` | `0.08` | Seconds per frame |
-| `spinnerWidth` | `14` | Cells in the track |
-| `spinnerGlyph` | `🚀` | |
-| `spinnerTrail` | `false` | `true` leaves dots behind the rocket |
+| `hudGlyph` | `🚀` | Rides the leading edge of the progress bar |
+| `hudFps` | `60` | Animation frames per second |
+| `hudDrop` | `0.70` | Vertical placement of the panel: `0` top of screen, `1` bottom |
 
 ## How it works
 
@@ -196,7 +225,7 @@ Open the Hammerspoon console (menu bar icon → Console) for errors.
 
 | Symptom | Cause |
 |---|---|
-| No alert at all | The keystroke never reached Hammerspoon. Check Accessibility, and that Hammerspoon is running. |
+| No panel at all | The keystroke never reached Hammerspoon. Check Accessibility, and that Hammerspoon is running. |
 | **Nothing selected** | ⌘C didn't land — nothing highlighted, or the app doesn't support standard copy. Webviews and Electron surfaces are common culprits. |
 | **API 401** | Key is wrong. Check for a doubled `sk-ant-` prefix, and confirm it's ~108 bytes starting `sk-ant-api03-`. |
 | Emoji picker opens on 🌐 | `AppleFnUsageType` isn't set to `0`, or needs a logout. |
@@ -208,7 +237,7 @@ Nothing is lost to a failed run: the original is written to `history.jsonl` befo
 ## Files
 
 ```
-prompt_enhancer.lua   capture, API call, history, spinner, repo context
+prompt_enhancer.lua   capture, API call, history, loading HUD, repo context
 claude_code.md        the rewrite rules — where behaviour lives
 init.lua              key bindings
 SETUP.md              original setup notes
